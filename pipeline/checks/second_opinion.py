@@ -40,5 +40,106 @@ from ..model_cache import get_preds  # noqa: F401
 
 
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    settings = cfg["second_opinion"]
+    issues = []
+
+    for image_path in ds.image_files():
+        stem = image_path.stem
+        raw_lines = ds.read_label_lines(stem)
+        if raw_lines is None or stem not in preds:
+            continue
+        size = ds.image_size(stem)
+        if size is None:
+            continue
+        image_width, image_height = size
+
+        labels = []
+        for line_no, text in raw_lines:
+            try:
+                box = parse_yolo_line(text)
+            except ValueError:
+                continue
+            if 0 <= box[0] < len(ds.classes):
+                labels.append((line_no, box))
+
+        raw_predictions = []
+        for row in preds[stem]:
+            if len(row) < 6:
+                continue
+            try:
+                cls_value = float(row[0])
+                confidence = float(row[1])
+                cls = int(cls_value)
+                cx, cy, width, height = (float(value) for value in row[2:6])
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if cls_value != cls:
+                continue
+            raw_predictions.append((cls, confidence, (cx, cy, width, height)))
+
+        model_predictions = [
+            prediction
+            for prediction in raw_predictions
+            if prediction[1] >= settings["conf"]
+            and prediction[2][2] * image_width * prediction[2][3] * image_height
+            >= settings["min_area_px"]
+        ]
+
+        for pred_class, confidence, pred_box in model_predictions:
+            candidates = [
+                (label_class, iou_xywh(pred_box, label_box))
+                for _, (label_class, *label_box) in labels
+                if iou_xywh(pred_box, label_box) >= settings["iou_missing"]
+            ]
+            if not candidates:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_MISSING", stem,
+                    "Model thấy vật thể nhưng nhãn không có box khớp",
+                    extra={"conf": confidence},
+                ))
+                continue
+
+            same_class = [iou for label_class, iou in candidates if label_class == pred_class]
+            if same_class:
+                best_iou = max(same_class)
+                if best_iou < settings["iou_loose"]:
+                    issues.append(Issue(
+                        "second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem,
+                        "Box nhãn cùng lớp có thể bị lỏng hoặc lệch",
+                        extra={"iou": best_iou, "conf": confidence},
+                    ))
+                continue
+
+            best_other_iou = max(iou for _, iou in candidates)
+            if best_other_iou >= settings["iou_match"]:
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem,
+                    "Model và nhãn có thể gán khác lớp cho cùng vật thể",
+                    extra={"iou": best_other_iou, "conf": confidence},
+                ))
+
+        false_positive_predictions = [
+            (pred_class, pred_box)
+            for pred_class, confidence, pred_box in raw_predictions
+            if confidence >= settings["fp_conf"]
+        ]
+        for line_no, (label_class, cx, cy, width, height) in labels:
+            label_box = (cx, cy, width, height)
+            if all(
+                iou_xywh(label_box, pred_box) < settings["iou_missing"]
+                for _, pred_box in false_positive_predictions
+            ):
+                issues.append(Issue(
+                    "second_opinion", WARN, "POSSIBLE_FALSE_POS", stem,
+                    "Box nhãn không khớp dự đoán nào đủ độ tin cậy",
+                    line_no,
+                    {"iou": max(
+                        (iou_xywh(label_box, pred_box) for _, pred_box in false_positive_predictions),
+                        default=0.0,
+                    )},
+                ))
+
+    return issues
