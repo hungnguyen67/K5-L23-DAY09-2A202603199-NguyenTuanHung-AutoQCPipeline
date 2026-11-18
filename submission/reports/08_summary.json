@@ -1,0 +1,18 @@
+{
+  "verdict": {
+    "decision": "Hold",
+    "n_errors": 0,
+    "n_warn_images": 62,
+    "n_images": 202,
+    "warn_ratio": 0.3069,
+    "reasons": [
+      "62/202 ảnh còn cảnh báo chưa duyệt (30.7%), đạt ngưỡng Hold 10.0%."
+    ]
+  },
+  "reviewed": 80,
+  "budget": 80,
+  "seconds": 7.2,
+  "exported": "D:\\Tệp\\BaiTapWeb\\New folder\\K5-L23-DAY09-2A202603199-NguyenTuanHung-AutoQCPipeline\\submission\\export\\clean_v1",
+  "config_sha1": "290449291a3a9e58d633da10e4fde57945cf02ce",
+  "review_sim_sha1": "7988ca22827f780a7043a2300490e679a1697154"
+}
