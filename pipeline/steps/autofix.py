@@ -35,5 +35,115 @@ from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [issue for issue in issues if issue.severity == ERROR]
+    fixes = []
+    removed_images = set()
+
+    def add_fix(image, line, action, before, after):
+        fixes.append({
+            "image": image,
+            "line": line,
+            "action": action,
+            "before": before,
+            "after": after,
+        })
+
+    for issue in errors:
+        code = issue.code
+        if not (code.startswith("DUP_IMAGE_") or code in {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}):
+            continue
+        stem = issue.image
+        if stem in removed_images:
+            continue
+        removed_images.add(stem)
+        image_paths = [path for path in ds.image_files() if path.stem == stem]
+        before = ", ".join(path.name for path in image_paths)
+        for path in image_paths:
+            path.unlink()
+        label_path = ds.label_path(stem)
+        if label_path.exists():
+            label_path.unlink()
+        add_fix(stem, None, "remove_image", before, "")
+
+    renamed = False
+    for issue in errors:
+        if issue.code != "BAD_CLASS_NAME" or renamed:
+            continue
+        names = {index: name for index, name in enumerate(cfg["classes"])}
+        data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        before = str(data.get("names", {}))
+        data["names"] = names
+        ds.yaml_path.write_text(
+            yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+            encoding="utf-8",
+        )
+        add_fix("data.yaml", None, "rename_classes", before, str(names))
+        renamed = True
+
+    for issue in errors:
+        if issue.code != "MISSING_LABEL_FILE" or issue.image in removed_images:
+            continue
+        add_fix(issue.image, None, "needs_label", "(không có file)", "chuyển người gán")
+
+    drop_codes = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+    line_issues = defaultdict(lambda: defaultdict(set))
+    for issue in errors:
+        if issue.image in removed_images or issue.line is None:
+            continue
+        if issue.code in drop_codes or issue.code == "BOX_OUT_OF_IMAGE":
+            line_issues[issue.image][issue.line].add(issue.code)
+
+    for stem, by_line in line_issues.items():
+        label_path = ds.label_path(stem)
+        if not label_path.exists():
+            continue
+        original_text = label_path.read_text(encoding="utf-8", errors="replace")
+        original_lines = original_text.splitlines()
+        updates = {}
+
+        for line_no in sorted(by_line):
+            if not 1 <= line_no <= len(original_lines):
+                continue
+            before = original_lines[line_no - 1]
+            codes = by_line[line_no]
+            if codes & drop_codes:
+                updates[line_no] = ("drop_line", "")
+                continue
+            if "BOX_OUT_OF_IMAGE" not in codes:
+                continue
+            try:
+                cls, cx, cy, width, height = parse_yolo_line(before)
+            except ValueError:
+                continue
+
+            x1, y1 = max(0.0, cx - width / 2), max(0.0, cy - height / 2)
+            x2, y2 = min(1.0, cx + width / 2), min(1.0, cy + height / 2)
+            clipped_width, clipped_height = x2 - x1, y2 - y1
+            if clipped_width <= 0 or clipped_height <= 0:
+                updates[line_no] = ("drop_line", "")
+            else:
+                clipped = (
+                    f"{cls} {(x1 + x2) / 2:.6f} {(y1 + y2) / 2:.6f} "
+                    f"{clipped_width:.6f} {clipped_height:.6f}"
+                )
+                if clipped != before:
+                    updates[line_no] = ("clip_box", clipped)
+
+        if not updates:
+            continue
+
+        for line_no, (action, after) in sorted(updates.items()):
+            add_fix(stem, line_no, action, original_lines[line_no - 1], after)
+
+        kept_lines = []
+        for line_no, line in enumerate(original_lines, 1):
+            update = updates.get(line_no)
+            if update and update[0] == "drop_line":
+                continue
+            kept_lines.append(update[1] if update else line)
+        new_text = "\n".join(kept_lines)
+        if original_text.endswith(("\n", "\r")) and kept_lines:
+            new_text += "\n"
+        label_path.write_text(new_text, encoding="utf-8")
+
+    return fixes
